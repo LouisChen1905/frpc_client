@@ -10,6 +10,9 @@ import shutil
 # List to store multiple instances
 running_instances = []  # Each item: {process, port, sk, password, config_file}
 
+# List to store running remote processes
+running_remote_processes = []  # Each item: {'process': process, 'command': command_text}
+
 command_file = os.path.join(os.path.dirname(__file__), 'ssh_commands.txt')
 
 def load_ssh_commands():
@@ -56,6 +59,15 @@ def update_instances_display():
             instances_listbox.insert(tk.END, f"Instance {i+1}: Port {inst['port']} - SK: {inst['sk']}")
         else:
             running_instances.remove(inst)
+
+def update_remote_commands_display():
+    """Update the running remote commands listbox"""
+    remote_commands_listbox.delete(0, tk.END)
+    for i, rem in enumerate(running_remote_processes):
+        if rem['process'].poll() is None:
+            remote_commands_listbox.insert(tk.END, f"Command {i+1}: {rem['command']}")
+        else:
+            running_remote_processes.remove(rem)
 
 def run_frpc():
     sk = sk_entry.get().strip()
@@ -131,6 +143,29 @@ def read_output(process, config_file):
     except Exception as e:
         output_text.insert(tk.END, f"Error reading output: {str(e)}")
 
+def read_remote_output(process, command_text):
+    try:
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                output_text.insert(tk.END, output)
+                output_text.see(tk.END)
+        # Read stderr
+        stderr_output = process.stderr.read()
+        if stderr_output:
+            output_text.insert(tk.END, "STDERR: " + stderr_output)
+            output_text.see(tk.END)
+        # Check return code
+        returncode = process.poll()
+        if returncode == 0:
+            status_label.config(text=f"Remote command '{command_text}' completed")
+        else:
+            status_label.config(text=f"Remote command '{command_text}' failed ({returncode})")
+    except Exception as e:
+        output_text.insert(tk.END, f"Error reading remote output: {str(e)}")
+
 def stop_frpc():
     selection = instances_listbox.curselection()
     if not selection:
@@ -163,6 +198,22 @@ def stop_all():
     running_instances.clear()
     status_label.config(text="All instances stopped")
     update_instances_display()
+
+def stop_remote_command():
+    selection = remote_commands_listbox.curselection()
+    if not selection:
+        status_label.config(text="Please select a remote command to stop")
+        return
+    idx = selection[0]
+    if idx < len(running_remote_processes):
+        rem = running_remote_processes[idx]
+        if rem['process'].poll() is None:
+            rem['process'].terminate()
+            running_remote_processes.pop(idx)
+            status_label.config(text="Remote command stopped")
+            update_remote_commands_display()
+        else:
+            status_label.config(text="Remote command already stopped")
 
 def open_mobaXterm():
     selection = instances_listbox.curselection()
@@ -246,14 +297,11 @@ def run_remote_command():
         output_text.insert(tk.END, f"Executing remote command with sshpass: {' '.join(cmd)}\n")
         output_text.see(tk.END)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            output_text.insert(tk.END, f"STDOUT:\n{result.stdout}\n")
-            output_text.insert(tk.END, f"STDERR:\n{result.stderr}\n")
-            output_text.see(tk.END)
-            if result.returncode == 0:
-                status_label.config(text="Remote command completed")
-            else:
-                status_label.config(text=f"Remote command failed ({result.returncode})")
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            threading.Thread(target=read_remote_output, args=(process, command_text), daemon=True).start()
+            status_label.config(text="Remote command started")
+            running_remote_processes.append({'process': process, 'command': command_text})
+            update_remote_commands_display()
         except Exception as e:
             status_label.config(text=f"Error executing remote command: {e}")
             output_text.insert(tk.END, f"Exception: {e}\n")
@@ -267,14 +315,11 @@ def run_remote_command():
         output_text.insert(tk.END, f"Executing remote command with sshpass from PATH: {' '.join(cmd)}\n")
         output_text.see(tk.END)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            output_text.insert(tk.END, f"STDOUT:\n{result.stdout}\n")
-            output_text.insert(tk.END, f"STDERR:\n{result.stderr}\n")
-            output_text.see(tk.END)
-            if result.returncode == 0:
-                status_label.config(text="Remote command completed")
-            else:
-                status_label.config(text=f"Remote command failed ({result.returncode})")
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            threading.Thread(target=read_remote_output, args=(process, command_text), daemon=True).start()
+            status_label.config(text="Remote command started")
+            running_remote_processes.append({'process': process, 'command': command_text})
+            update_remote_commands_display()
         except Exception as e:
             status_label.config(text=f"Error executing remote command: {e}")
             output_text.insert(tk.END, f"Exception: {e}\n")
@@ -287,14 +332,11 @@ def run_remote_command():
         output_text.insert(tk.END, f"sshpass not found; executing remote command with ssh: {' '.join(cmd)}\n")
         output_text.see(tk.END)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            output_text.insert(tk.END, f"STDOUT:\n{result.stdout}\n")
-            output_text.insert(tk.END, f"STDERR:\n{result.stderr}\n")
-            output_text.see(tk.END)
-            if result.returncode == 0:
-                status_label.config(text="Remote command completed")
-            else:
-                status_label.config(text=f"Remote command failed ({result.returncode})")
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            threading.Thread(target=read_remote_output, args=(process, command_text), daemon=True).start()
+            status_label.config(text="Remote command started")
+            running_remote_processes.append({'process': process, 'command': command_text})
+            update_remote_commands_display()
         except Exception as e:
             status_label.config(text=f"Error executing remote command: {e}")
             output_text.insert(tk.END, f"Exception: {e}\n")
@@ -321,35 +363,51 @@ def run_remote_command():
 root = tk.Tk()
 root.title("FRP Client Runner")
 
-tk.Label(root, text="Secret Key (sk):").pack(pady=5)
-sk_entry = tk.Entry(root, width=30)
+# Create frames
+left_frame = tk.Frame(root)
+left_frame.pack(side=tk.LEFT, fill=tk.Y)
+
+right_frame = tk.Frame(root)
+right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+# Output text in left frame
+output_text = scrolledtext.ScrolledText(right_frame)
+output_text.pack(fill=tk.BOTH, expand=True)
+
+# Controls in right frame
+tk.Label(left_frame, text="Secret Key (sk):").pack(pady=5)
+sk_entry = tk.Entry(left_frame, width=30)
 sk_entry.pack(pady=5)
 
-tk.Label(root, text="SSH Password:").pack(pady=5)
-password_combo = ttk.Combobox(root, width=40, values=["11", "Xfesd203DSRGiedlxadF", "Psg-vsn.110"], state="readonly")
+tk.Label(left_frame, text="SSH Password:").pack(pady=5)
+password_combo = ttk.Combobox(left_frame, width=40, values=["11", "Xfesd203DSRGiedlxadF", "Psg-vsn.110"], state="readonly")
 password_combo.pack(pady=5)
 password_combo.set("11")
 
-tk.Label(root, text="Remote SSH Command:").pack(pady=5)
-command_entry = tk.Entry(root, width=80)
+tk.Label(left_frame, text="Remote SSH Command:").pack(pady=5)
+command_entry = tk.Entry(left_frame, width=80)
 command_entry.pack(pady=5)
-command_combo = ttk.Combobox(root, width=80, state="readonly")
+command_combo = ttk.Combobox(left_frame, width=80, state="readonly")
 command_combo.pack(pady=5)
-command_save_frame = tk.Frame(root)
+command_save_frame = tk.Frame(left_frame)
 command_save_frame.pack(pady=5)
 command_save_button = tk.Button(command_save_frame, text="Save Command", command=save_command)
 command_save_button.pack(side=tk.LEFT, padx=5)
 command_refresh_button = tk.Button(command_save_frame, text="Refresh Commands", command=refresh_command_combo)
 command_refresh_button.pack(side=tk.LEFT, padx=5)
 
-port_label = tk.Label(root, text="Next port: Not set")
+port_label = tk.Label(left_frame, text="Next port: Not set")
 port_label.pack(pady=5)
 
-tk.Label(root, text="Running Instances:").pack(pady=5)
-instances_listbox = tk.Listbox(root, width=50, height=6)
+tk.Label(left_frame, text="Running Instances:").pack(pady=5)
+instances_listbox = tk.Listbox(left_frame, width=50, height=6)
 instances_listbox.pack(pady=5)
 
-button_frame = tk.Frame(root)
+tk.Label(left_frame, text="Running Remote Commands:").pack(pady=5)
+remote_commands_listbox = tk.Listbox(left_frame, width=50, height=4)
+remote_commands_listbox.pack(pady=5)
+
+button_frame = tk.Frame(left_frame)
 button_frame.pack(pady=5)
 run_button = tk.Button(button_frame, text="Run FRPC", command=run_frpc)
 run_button.pack(side=tk.LEFT, padx=5)
@@ -361,12 +419,12 @@ mobaXterm_button = tk.Button(button_frame, text="Open MobaXterm SSH", command=op
 mobaXterm_button.pack(side=tk.LEFT, padx=5)
 remote_button = tk.Button(button_frame, text="Run Remote Command", command=run_remote_command)
 remote_button.pack(side=tk.LEFT, padx=5)
+stop_remote_button = tk.Button(button_frame, text="Stop Remote Command", command=stop_remote_command)
+stop_remote_button.pack(side=tk.LEFT, padx=5)
 
-status_label = tk.Label(root, text="")
+status_label = tk.Label(left_frame, text="")
 status_label.pack(pady=5)
 
-output_text = scrolledtext.ScrolledText(root, width=80, height=15)
-output_text.pack(pady=5)
-
 refresh_command_combo()
+root.resizable(True, True)
 root.mainloop()
