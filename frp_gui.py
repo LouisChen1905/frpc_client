@@ -5,9 +5,48 @@ import tempfile
 import os
 import threading
 import random
+import shutil
 
 # List to store multiple instances
 running_instances = []  # Each item: {process, port, sk, password, config_file}
+
+command_file = os.path.join(os.path.dirname(__file__), 'ssh_commands.txt')
+
+def load_ssh_commands():
+    if not os.path.exists(command_file):
+        with open(command_file, 'w', encoding='utf-8') as f:
+            f.write('uname -a\n')
+            f.write('id\n')
+            f.write('ls -la\n')
+    commands = []
+    with open(command_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            text = line.strip()
+            if text:
+                commands.append(text)
+    return commands
+
+def refresh_command_combo():
+    commands = load_ssh_commands()
+    command_combo['values'] = commands
+    if commands:
+        command_combo.set(commands[0])
+
+
+def save_command():
+    cmd = command_entry.get().strip()
+    if not cmd:
+        status_label.config(text='Please enter a command to save')
+        return
+    commands = load_ssh_commands()
+    if cmd in commands:
+        status_label.config(text='Command already exists')
+        return
+    with open(command_file, 'a', encoding='utf-8') as f:
+        f.write(cmd + '\n')
+    refresh_command_combo()
+    status_label.config(text='Command saved')
+
 
 def update_instances_display():
     """Update the running instances listbox"""
@@ -171,6 +210,113 @@ def open_mobaXterm():
             output_text.insert(tk.END, f"Error opening MobaXterm: {e2}\n")
             output_text.see(tk.END)
 
+
+def run_remote_command():
+    selection = instances_listbox.curselection()
+    if not selection:
+        status_label.config(text="Please select an instance")
+        return
+    
+    idx = selection[0]
+    if idx >= len(running_instances):
+        status_label.config(text="Invalid instance")
+        return
+    
+    inst = running_instances[idx]
+    bind_port = inst['port']
+    password = inst['password'].strip()
+    if not password:
+        status_label.config(text="Please select a password")
+        return
+    
+    command_text = command_entry.get().strip()
+    if not command_text:
+        command_text = command_combo.get().strip()
+    if not command_text:
+        status_label.config(text="Please enter or select a command")
+        return
+
+    sshpass_path = r"sshpass"
+    if os.path.exists(sshpass_path):
+        cmd = [
+            sshpass_path, '-p', password,
+            'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
+            command_text
+        ]
+        output_text.insert(tk.END, f"Executing remote command with sshpass: {' '.join(cmd)}\n")
+        output_text.see(tk.END)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            output_text.insert(tk.END, f"STDOUT:\n{result.stdout}\n")
+            output_text.insert(tk.END, f"STDERR:\n{result.stderr}\n")
+            output_text.see(tk.END)
+            if result.returncode == 0:
+                status_label.config(text="Remote command completed")
+            else:
+                status_label.config(text=f"Remote command failed ({result.returncode})")
+        except Exception as e:
+            status_label.config(text=f"Error executing remote command: {e}")
+            output_text.insert(tk.END, f"Exception: {e}\n")
+            output_text.see(tk.END)
+    elif shutil.which('sshpass'):
+        cmd = [
+            'sshpass', '-p', password,
+            'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
+            command_text
+        ]
+        output_text.insert(tk.END, f"Executing remote command with sshpass from PATH: {' '.join(cmd)}\n")
+        output_text.see(tk.END)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            output_text.insert(tk.END, f"STDOUT:\n{result.stdout}\n")
+            output_text.insert(tk.END, f"STDERR:\n{result.stderr}\n")
+            output_text.see(tk.END)
+            if result.returncode == 0:
+                status_label.config(text="Remote command completed")
+            else:
+                status_label.config(text=f"Remote command failed ({result.returncode})")
+        except Exception as e:
+            status_label.config(text=f"Error executing remote command: {e}")
+            output_text.insert(tk.END, f"Exception: {e}\n")
+            output_text.see(tk.END)
+    elif shutil.which('ssh'):
+        cmd = [
+            'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
+            command_text
+        ]
+        output_text.insert(tk.END, f"sshpass not found; executing remote command with ssh: {' '.join(cmd)}\n")
+        output_text.see(tk.END)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            output_text.insert(tk.END, f"STDOUT:\n{result.stdout}\n")
+            output_text.insert(tk.END, f"STDERR:\n{result.stderr}\n")
+            output_text.see(tk.END)
+            if result.returncode == 0:
+                status_label.config(text="Remote command completed")
+            else:
+                status_label.config(text=f"Remote command failed ({result.returncode})")
+        except Exception as e:
+            status_label.config(text=f"Error executing remote command: {e}")
+            output_text.insert(tk.END, f"Exception: {e}\n")
+            output_text.see(tk.END)
+    else:
+        mobaXterm_path = r"C:\Users\175912\Desktop\MobaXterm_Portable_v20.6\MobaXterm_Personal_20.6.exe"
+        ssh_cmd = f"ssh -l root 127.0.0.1 -p {bind_port} \"{command_text}\""
+        output_text.insert(tk.END, "sshpass and ssh not found on PATH.\n")
+        output_text.insert(tk.END, f"Opening MobaXterm for manual execution: {mobaXterm_path} -newtab {ssh_cmd}\n")
+        output_text.see(tk.END)
+        try:
+            subprocess.Popen([mobaXterm_path, "-newtab", ssh_cmd])
+            status_label.config(text="Opened MobaXterm for manual remote command")
+        except FileNotFoundError:
+            status_label.config(text="MobaXterm not found at specified path")
+            output_text.insert(tk.END, "Error: MobaXterm not found at specified path\n")
+            output_text.see(tk.END)
+        except Exception as e:
+            status_label.config(text=f"Error opening MobaXterm: {e}")
+            output_text.insert(tk.END, f"Error opening MobaXterm: {e}\n")
+            output_text.see(tk.END)
+
 # Create GUI
 root = tk.Tk()
 root.title("FRP Client Runner")
@@ -183,6 +329,18 @@ tk.Label(root, text="SSH Password:").pack(pady=5)
 password_combo = ttk.Combobox(root, width=40, values=["11", "Xfesd203DSRGiedlxadF", "Psg-vsn.110"], state="readonly")
 password_combo.pack(pady=5)
 password_combo.set("11")
+
+tk.Label(root, text="Remote SSH Command:").pack(pady=5)
+command_entry = tk.Entry(root, width=80)
+command_entry.pack(pady=5)
+command_combo = ttk.Combobox(root, width=80, state="readonly")
+command_combo.pack(pady=5)
+command_save_frame = tk.Frame(root)
+command_save_frame.pack(pady=5)
+command_save_button = tk.Button(command_save_frame, text="Save Command", command=save_command)
+command_save_button.pack(side=tk.LEFT, padx=5)
+command_refresh_button = tk.Button(command_save_frame, text="Refresh Commands", command=refresh_command_combo)
+command_refresh_button.pack(side=tk.LEFT, padx=5)
 
 port_label = tk.Label(root, text="Next port: Not set")
 port_label.pack(pady=5)
@@ -201,6 +359,8 @@ stop_all_button = tk.Button(button_frame, text="Stop All", command=stop_all)
 stop_all_button.pack(side=tk.LEFT, padx=5)
 mobaXterm_button = tk.Button(button_frame, text="Open MobaXterm SSH", command=open_mobaXterm)
 mobaXterm_button.pack(side=tk.LEFT, padx=5)
+remote_button = tk.Button(button_frame, text="Run Remote Command", command=run_remote_command)
+remote_button.pack(side=tk.LEFT, padx=5)
 
 status_label = tk.Label(root, text="")
 status_label.pack(pady=5)
@@ -208,4 +368,5 @@ status_label.pack(pady=5)
 output_text = scrolledtext.ScrolledText(root, width=80, height=15)
 output_text.pack(pady=5)
 
+refresh_command_combo()
 root.mainloop()
