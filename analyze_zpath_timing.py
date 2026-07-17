@@ -310,26 +310,28 @@ def export_excel(path, window_start, window_end, coverage_intervals,
     summary.append(["结束时间", window_end])
     summary.append(["ZPATH有效时长(s)", zpath_total])
     summary.append([])
-    summary.append(["状态", "次数", "总时长(s)", "平均(s)", "中位(s)",
-                    "最小(s)", "最大(s)", "占父状态比例"])
+    summary.append(["状态", "父状态", "次数", "总时长(s)", "平均(s)", "中位(s)",
+                    "最小(s)", "最大(s)", "占父状态比例", "比例说明"])
 
     summary_rows = [
-        ("COVERAGE", coverage_stats, coverage_stats["total"]),
-        ("EDGE_COVERAGE", edge_stats, coverage_stats["total"]),
-        ("ZPATH", zpath_stats, coverage_stats["total"]),
-        ("GO_POSITION", go_stats, zpath_total),
+        ("COVERAGE", "COVERAGE", coverage_stats, coverage_stats["total"]),
+        ("EDGE_COVERAGE", "COVERAGE", edge_stats, coverage_stats["total"]),
+        ("ZPATH", "COVERAGE", zpath_stats, coverage_stats["total"]),
+        ("GO_POSITION", "ZPATH", go_stats, zpath_total),
     ]
     summary_rows.extend(
-        (state, describe([item["duration"] for item in child_intervals[state]]),
+        (state, "GO_POSITION",
+         describe([item["duration"] for item in child_intervals[state]]),
          go_stats["total"])
         for state in child_states
     )
-    for state, stats, parent_total in summary_rows:
+    for state, parent_state, stats, parent_total in summary_rows:
         ratio = stats["total"] / parent_total if parent_total else 0.0
         summary.append([
-            state, stats["count"], stats["total"], stats["average"],
+            state, parent_state, stats["count"], stats["total"], stats["average"],
             stats["median"], stats["minimum"], stats["maximum"],
             ratio,
+            "{} / {} 时长占比：{:.2%}".format(state, parent_state, ratio),
         ])
 
     detail_header = ["序号", "GO开始", "GO结束", "GO时长(s)"]
@@ -386,12 +388,12 @@ def export_excel(path, window_start, window_end, coverage_intervals,
         sheet.auto_filter.ref = sheet.dimensions
 
     summary["A1"].font = Font(size=14, bold=True)
-    summary.merge_cells("A1:H1")
+    summary.merge_cells("A1:J1")
     summary["A1"].alignment = Alignment(horizontal="center")
     for cell in (summary["B2"], summary["B3"]):
         cell.number_format = "yyyy-mm-dd hh:mm:ss.000"
     for row_number in range(7, summary.max_row + 1):
-        summary.cell(row_number, 8).number_format = "0.00%"
+        summary.cell(row_number, 9).number_format = "0.00%"
     for row_number in range(2, details.max_row + 1):
         details.cell(row_number, 2).number_format = "yyyy-mm-dd hh:mm:ss.000"
         details.cell(row_number, 3).number_format = "yyyy-mm-dd hh:mm:ss.000"
@@ -405,7 +407,7 @@ def export_excel(path, window_start, window_end, coverage_intervals,
         coverage_details.cell(row_number, 4).number_format = "yyyy-mm-dd hh:mm:ss.000"
 
     widths = {
-        summary: [20, 22, 16, 14, 14, 14, 14, 14],
+        summary: [20, 20, 12, 16, 14, 14, 14, 14, 16, 48],
         details: [8, 24, 24, 14] + [14, 12] * len(child_states) + [10, 10],
         state_details: [10, 20, 24, 24, 14, 10, 10],
         coverage_details: [20, 10, 24, 24, 14, 10, 10],
@@ -418,13 +420,13 @@ def export_excel(path, window_start, window_end, coverage_intervals,
         chart = BarChart()
         chart.title = "各状态总时长"
         chart.y_axis.title = "时长(s)"
-        data = Reference(summary, min_col=3, min_row=6, max_row=summary.max_row)
+        data = Reference(summary, min_col=4, min_row=6, max_row=summary.max_row)
         categories = Reference(summary, min_col=1, min_row=7, max_row=summary.max_row)
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(categories)
         chart.height = 7
         chart.width = 13
-        summary.add_chart(chart, "J2")
+        summary.add_chart(chart, "L2")
 
     workbook.save(str(path))
 
