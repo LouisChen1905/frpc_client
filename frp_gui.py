@@ -1,11 +1,15 @@
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from tkinter import filedialog, scrolledtext, ttk
 import subprocess
 import tempfile
 import os
 import threading
 import random
 import shutil
+import csv
+import time
+import re
+from datetime import datetime
 
 # List to store multiple instances
 running_instances = []  # Each item: {process, port, sk, password, config_file}
@@ -13,7 +17,27 @@ running_instances = []  # Each item: {process, port, sk, password, config_file}
 # List to store running remote processes
 running_remote_processes = []  # Each item: {'process': process, 'command': command_text}
 
+imported_secret_keys = []
+batch_running = False
+
 command_file = os.path.join(os.path.dirname(__file__), 'ssh_commands.txt')
+ansi_escape_pattern = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+SUBPROCESS_TEXT_KWARGS = {
+    'text': True,
+    'encoding': 'utf-8',
+    'errors': 'replace'
+}
+
+
+def append_output(message):
+    output_text.insert(tk.END, message)
+    output_text.see(tk.END)
+
+
+def clean_terminal_output(text):
+    if not text:
+        return text
+    return ansi_escape_pattern.sub('', text)
 
 def load_ssh_commands():
     if not os.path.exists(command_file):
@@ -36,19 +60,269 @@ def refresh_command_combo():
         command_combo.set(commands[0])
 
 
+def set_status(message):
+    status_label.config(text=message)
+
+
 def save_command():
     cmd = command_entry.get().strip()
     if not cmd:
-        status_label.config(text='Please enter a command to save')
+        set_status('Please enter a command to save')
         return
     commands = load_ssh_commands()
     if cmd in commands:
-        status_label.config(text='Command already exists')
+        set_status('Command already exists')
         return
     with open(command_file, 'a', encoding='utf-8') as f:
         f.write(cmd + '\n')
     refresh_command_combo()
-    status_label.config(text='Command saved')
+    set_status('Command saved')
+
+
+def build_config_content(sk, bind_port):
+    return f"""[common]
+server_addr = 52.83.111.247
+server_port = 7000
+
+[secret_ssh_cs]
+type = stcp
+role = visitor
+server_name = secret_ssh_{sk}
+sk = {sk}
+bind_addr = 127.0.0.1
+bind_port = {bind_port}
+"""
+
+
+def create_temp_config(sk, bind_port):
+    config_content = build_config_content(sk, bind_port)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.ini', delete=False, encoding='utf-8') as f:
+        f.write(config_content)
+        return f.name
+
+
+def start_frpc_instance(sk, password, keep_running=True):
+    bind_port = random.randint(10000, 65535)
+    port_label.config(text=f"Next port: {bind_port}")
+    temp_config = create_temp_config(sk, bind_port)
+
+    process = subprocess.Popen(
+        ['frpc.exe', '-c', temp_config],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **SUBPROCESS_TEXT_KWARGS
+    )
+
+    instance = {
+        'process': process,
+        'port': bind_port,
+        'sk': sk,
+        'password': password,
+        'config_file': temp_config
+    }
+
+    if keep_running:
+        running_instances.append(instance)
+        update_instances_display()
+        threading.Thread(target=read_output, args=(process, temp_config), daemon=True).start()
+
+    return instance
+
+
+def cleanup_instance(inst, remove_from_running=True):
+    process = inst['process']
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    try:
+        os.unlink(inst['config_file'])
+    except OSError:
+        pass
+    if remove_from_running and inst in running_instances:
+        running_instances.remove(inst)
+        update_instances_display()
+
+
+def build_ssh_command(bind_port, password, command_text):
+    sshpass_local = os.path.join(os.path.dirname(__file__), 'sshpass.exe')
+    if os.path.exists(sshpass_local):
+        return [
+            sshpass_local, '-p', password,
+            'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
+            command_text
+        ]
+    if shutil.which('sshpass'):
+        return [
+            'sshpass', '-p', password,
+            'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
+            command_text
+        ]
+    if shutil.which('ssh'):
+        return [
+            'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
+            command_text
+        ]
+    raise FileNotFoundError('sshpass.exe / sshpass / ssh not found')
+
+
+def execute_remote_command_sync(bind_port, password, command_text, timeout=120):
+    cmd = build_ssh_command(bind_port, password, command_text)
+    completed = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **SUBPROCESS_TEXT_KWARGS,
+        timeout=timeout
+    )
+    return {
+        'command': ' '.join(cmd),
+        'returncode': completed.returncode,
+        'stdout': clean_terminal_output(completed.stdout),
+        'stderr': clean_terminal_output(completed.stderr)
+    }
+
+
+def normalize_secret_key(raw_key):
+    key = raw_key.replace('\ufeff', '').strip()
+    if key.upper().startswith('XRM'):
+        digits = ''.join(ch for ch in key if ch.isdigit())
+        if len(digits) >= 10:
+            return digits[-10:]
+    return key
+
+
+def import_secret_keys():
+    file_path = filedialog.askopenfilename(
+        title='Select secret key list',
+        filetypes=[('Text/CSV Files', '*.txt *.csv'), ('All Files', '*.*')]
+    )
+    if not file_path:
+        return
+
+    keys = []
+    with open(file_path, 'r', encoding='utf-8-sig') as f:
+        for line in f:
+            for part in line.replace(',', '\n').splitlines():
+                key = normalize_secret_key(part)
+                if key:
+                    keys.append(key)
+
+    seen = set()
+    unique_keys = []
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            unique_keys.append(key)
+
+    imported_secret_keys.clear()
+    imported_secret_keys.extend(unique_keys)
+    key_count_label.config(text=f"Imported keys: {len(imported_secret_keys)}")
+    append_output(f"Imported {len(imported_secret_keys)} secret keys from {file_path}\n")
+    set_status(f"Imported {len(imported_secret_keys)} keys")
+
+
+def save_batch_results(results, output_file):
+    with open(output_file, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow(['secret_key', 'return_code', 'stdout', 'stderr', 'executed_at'])
+        for item in results:
+            writer.writerow([
+                item['secret_key'],
+                item['return_code'],
+                item['stdout'],
+                item['stderr'],
+                item['executed_at']
+            ])
+
+
+def run_batch_remote_commands():
+    global batch_running
+
+    if batch_running:
+        set_status('Batch task is already running')
+        return
+    if not imported_secret_keys:
+        set_status('Please import secret keys first')
+        return
+
+    password = password_combo.get().strip()
+    if not password:
+        set_status('Please select a password')
+        return
+
+    command_text = command_entry.get().strip() or command_combo.get().strip()
+    if not command_text:
+        set_status('Please enter or select a command')
+        return
+
+    output_file = filedialog.asksaveasfilename(
+        title='Save batch result',
+        defaultextension='.csv',
+        initialfile=f"batch_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        filetypes=[('CSV Files', '*.csv')]
+    )
+    if not output_file:
+        return
+
+    def worker():
+        global batch_running
+        batch_running = True
+        results = []
+        append_output(f"Starting batch execution for {len(imported_secret_keys)} keys\n")
+        set_status('Batch execution started')
+
+        try:
+            for index, raw_sk in enumerate(imported_secret_keys, start=1):
+                sk = normalize_secret_key(raw_sk)
+                append_output(f"\n[{index}/{len(imported_secret_keys)}] Processing key: {sk}\n")
+                set_status(f"Processing {index}/{len(imported_secret_keys)}: {sk}")
+
+                inst = None
+                try:
+                    inst = start_frpc_instance(sk, password, keep_running=False)
+                    time.sleep(3)
+                    result = execute_remote_command_sync(inst['port'], password, command_text)
+                    append_output(result['stdout'])
+                    if result['stderr']:
+                        append_output("STDERR: " + result['stderr'])
+                    results.append({
+                        'secret_key': sk,
+                        'return_code': result['returncode'],
+                        'stdout': result['stdout'].strip(),
+                        'stderr': result['stderr'].strip(),
+                        'executed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                except subprocess.TimeoutExpired:
+                    append_output(f"Command timed out for key: {sk}\n")
+                    results.append({
+                        'secret_key': sk,
+                        'return_code': 'timeout',
+                        'stdout': '',
+                        'stderr': 'Command timed out',
+                        'executed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                except Exception as e:
+                    append_output(f"Error for key {sk}: {e}\n")
+                    results.append({
+                        'secret_key': sk,
+                        'return_code': 'error',
+                        'stdout': '',
+                        'stderr': str(e),
+                        'executed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                finally:
+                    if inst is not None:
+                        cleanup_instance(inst, remove_from_running=False)
+        finally:
+            save_batch_results(results, output_file)
+            append_output(f"\nBatch results saved to: {output_file}\n")
+            set_status(f"Batch completed, saved to {os.path.basename(output_file)}")
+            batch_running = False
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def update_instances_display():
@@ -70,58 +344,18 @@ def update_remote_commands_display():
             running_remote_processes.remove(rem)
 
 def run_frpc():
-    sk = sk_entry.get().strip()
+    sk = normalize_secret_key(sk_entry.get())
     if not sk:
-        status_label.config(text="Please enter a secret key (sk)")
+        set_status("Please enter a secret key (sk)")
         return
 
-    # Generate random bind_port
-    bind_port = random.randint(10000, 65535)
-
-    # Update port label
-    port_label.config(text=f"Next port: {bind_port}")
-
-    # Generate config content
-    config_content = f"""[common]
-server_addr = 52.83.111.247
-server_port = 7000
-
-[secret_ssh_cs]
-type = stcp
-role = visitor
-server_name = secret_ssh_{sk}
-sk = {sk}
-bind_addr = 127.0.0.1
-bind_port = {bind_port}
-"""
-
-    # Create temporary config file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.ini', delete=False) as f:
-        f.write(config_content)
-        temp_config = f.name
-
     try:
-        # Run frpc.exe with the config
-        process = subprocess.Popen(['frpc.exe', '-c', temp_config], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
-        # Add to running instances
-        running_instances.append({
-            'process': process,
-            'port': bind_port,
-            'sk': sk,
-            'password': password_combo.get(),
-            'config_file': temp_config
-        })
-        
-        status_label.config(text=f"FRP instance started on port {bind_port}")
-        update_instances_display()
-        
-        # Start thread to read output
-        threading.Thread(target=read_output, args=(process, temp_config), daemon=True).start()
+        inst = start_frpc_instance(sk, password_combo.get(), keep_running=True)
+        set_status(f"FRP instance started on port {inst['port']}")
     except FileNotFoundError:
-        status_label.config(text="frpc.exe not found in current directory")
+        set_status("frpc.exe not found in current directory")
     except Exception as e:
-        status_label.config(text=f"Error running frpc: {str(e)}")
+        set_status(f"Error running frpc: {str(e)}")
 
 def read_output(process, config_file):
     try:
@@ -130,18 +364,16 @@ def read_output(process, config_file):
             if output == '' and process.poll() is not None:
                 break
             if output:
-                output_text.insert(tk.END, output)
-                output_text.see(tk.END)
+                append_output(clean_terminal_output(output))
         # Read stderr
-        stderr_output = process.stderr.read()
+        stderr_output = clean_terminal_output(process.stderr.read())
         if stderr_output:
-            output_text.insert(tk.END, "STDERR: " + stderr_output)
-            output_text.see(tk.END)
+            append_output("STDERR: " + stderr_output)
         # Clean up
         os.unlink(config_file)
-        status_label.config(text="FRP client stopped")
+        set_status("FRP client stopped")
     except Exception as e:
-        output_text.insert(tk.END, f"Error reading output: {str(e)}")
+        append_output(f"Error reading output: {str(e)}")
 
 def read_remote_output(process, command_text):
     try:
@@ -150,59 +382,47 @@ def read_remote_output(process, command_text):
             if output == '' and process.poll() is not None:
                 break
             if output:
-                output_text.insert(tk.END, output)
-                output_text.see(tk.END)
+                append_output(clean_terminal_output(output))
         # Read stderr
-        stderr_output = process.stderr.read()
+        stderr_output = clean_terminal_output(process.stderr.read())
         if stderr_output:
-            output_text.insert(tk.END, "STDERR: " + stderr_output)
-            output_text.see(tk.END)
+            append_output("STDERR: " + stderr_output)
         # Check return code
         returncode = process.poll()
         if returncode == 0:
-            status_label.config(text=f"Remote command '{command_text}' completed")
+            set_status(f"Remote command '{command_text}' completed")
         else:
-            status_label.config(text=f"Remote command '{command_text}' failed ({returncode})")
+            set_status(f"Remote command '{command_text}' failed ({returncode})")
     except Exception as e:
-        output_text.insert(tk.END, f"Error reading remote output: {str(e)}")
+        append_output(f"Error reading remote output: {str(e)}")
 
 def stop_frpc():
     selection = instances_listbox.curselection()
     if not selection:
-        status_label.config(text="Please select an instance to stop")
+        set_status("Please select an instance to stop")
         return
     
     idx = selection[0]
     if idx < len(running_instances):
         inst = running_instances[idx]
         if inst['process'].poll() is None:
-            inst['process'].terminate()
-            try:
-                os.unlink(inst['config_file'])
-            except:
-                pass
-            running_instances.pop(idx)
-            status_label.config(text="Instance stopped")
-            update_instances_display()
+            cleanup_instance(inst)
+            set_status("Instance stopped")
         else:
-            status_label.config(text="Instance already stopped")
+            set_status("Instance already stopped")
 
 def stop_all():
     for inst in running_instances:
         if inst['process'].poll() is None:
-            inst['process'].terminate()
-            try:
-                os.unlink(inst['config_file'])
-            except:
-                pass
+            cleanup_instance(inst, remove_from_running=False)
     running_instances.clear()
-    status_label.config(text="All instances stopped")
+    set_status("All instances stopped")
     update_instances_display()
 
 def stop_remote_command():
     selection = remote_commands_listbox.curselection()
     if not selection:
-        status_label.config(text="Please select a remote command to stop")
+        set_status("Please select a remote command to stop")
         return
     idx = selection[0]
     if idx < len(running_remote_processes):
@@ -210,20 +430,20 @@ def stop_remote_command():
         if rem['process'].poll() is None:
             rem['process'].terminate()
             running_remote_processes.pop(idx)
-            status_label.config(text="Remote command stopped")
+            set_status("Remote command stopped")
             update_remote_commands_display()
         else:
-            status_label.config(text="Remote command already stopped")
+            set_status("Remote command already stopped")
 
 def open_mobaXterm():
     selection = instances_listbox.curselection()
     if not selection:
-        status_label.config(text="Please select an instance")
+        set_status("Please select an instance")
         return
     
     idx = selection[0]
     if idx >= len(running_instances):
-        status_label.config(text="Invalid instance")
+        set_status("Invalid instance")
         return
     
     inst = running_instances[idx]
@@ -231,7 +451,7 @@ def open_mobaXterm():
     selected_password = inst['password'].strip()
     
     if not selected_password:
-        status_label.config(text="Please select a password")
+        set_status("Please select a password")
         return
     
     mobaXterm_path = r"C:\Users\175912\Desktop\MobaXterm_Portable_v20.6\MobaXterm_Personal_20.6.exe"
@@ -239,125 +459,75 @@ def open_mobaXterm():
     # Try to use sshpass if available, otherwise use plain ssh
     try:
         ssh_cmd = f"sshpass -p '{selected_password}' ssh -l root 127.0.0.1 -p {bind_port}"
-        output_text.insert(tk.END, f"Launching MobaXterm command: {mobaXterm_path} -newtab {ssh_cmd}\n")
-        output_text.see(tk.END)
+        append_output(f"Launching MobaXterm command: {mobaXterm_path} -newtab {ssh_cmd}\n")
         subprocess.Popen([mobaXterm_path, "-newtab", ssh_cmd])
-        status_label.config(text=f"Opened MobaXterm SSH session on port {bind_port}")
+        set_status(f"Opened MobaXterm SSH session on port {bind_port}")
     except Exception as e:
-        output_text.insert(tk.END, f"sshpass launch failed, falling back to plain ssh. Error: {e}\n")
-        output_text.see(tk.END)
+        append_output(f"sshpass launch failed, falling back to plain ssh. Error: {e}\n")
         ssh_cmd = f"ssh -l root 127.0.0.1 -p {bind_port}"
         try:
-            output_text.insert(tk.END, f"Launching MobaXterm command: {mobaXterm_path} -newtab {ssh_cmd}\n")
-            output_text.see(tk.END)
+            append_output(f"Launching MobaXterm command: {mobaXterm_path} -newtab {ssh_cmd}\n")
             subprocess.Popen([mobaXterm_path, "-newtab", ssh_cmd])
-            status_label.config(text=f"Opened MobaXterm SSH session on port {bind_port}")
+            set_status(f"Opened MobaXterm SSH session on port {bind_port}")
         except FileNotFoundError:
-            status_label.config(text="MobaXterm not found at specified path")
-            output_text.insert(tk.END, "Error: MobaXterm not found at specified path\n")
-            output_text.see(tk.END)
+            set_status("MobaXterm not found at specified path")
+            append_output("Error: MobaXterm not found at specified path\n")
         except Exception as e2:
-            status_label.config(text=f"Error opening MobaXterm: {str(e2)}")
-            output_text.insert(tk.END, f"Error opening MobaXterm: {e2}\n")
-            output_text.see(tk.END)
+            set_status(f"Error opening MobaXterm: {str(e2)}")
+            append_output(f"Error opening MobaXterm: {e2}\n")
 
 
 def run_remote_command():
     selection = instances_listbox.curselection()
     if not selection:
-        status_label.config(text="Please select an instance")
+        set_status("Please select an instance")
         return
     
     idx = selection[0]
     if idx >= len(running_instances):
-        status_label.config(text="Invalid instance")
+        set_status("Invalid instance")
         return
     
     inst = running_instances[idx]
     bind_port = inst['port']
     password = inst['password'].strip()
     if not password:
-        status_label.config(text="Please select a password")
+        set_status("Please select a password")
         return
     
     command_text = command_entry.get().strip()
     if not command_text:
         command_text = command_combo.get().strip()
     if not command_text:
-        status_label.config(text="Please enter or select a command")
+        set_status("Please enter or select a command")
         return
 
-    sshpass_path = r"sshpass"
-    if os.path.exists(sshpass_path):
-        cmd = [
-            sshpass_path, '-p', password,
-            'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
-            command_text
-        ]
-        output_text.insert(tk.END, f"Executing remote command with sshpass: {' '.join(cmd)}\n")
-        output_text.see(tk.END)
+    try:
+        cmd = build_ssh_command(bind_port, password, command_text)
+        append_output(f"Executing remote command: {' '.join(cmd)}\n")
         try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **SUBPROCESS_TEXT_KWARGS)
             threading.Thread(target=read_remote_output, args=(process, command_text), daemon=True).start()
-            status_label.config(text="Remote command started")
+            set_status("Remote command started")
             running_remote_processes.append({'process': process, 'command': command_text})
             update_remote_commands_display()
         except Exception as e:
-            status_label.config(text=f"Error executing remote command: {e}")
-            output_text.insert(tk.END, f"Exception: {e}\n")
-            output_text.see(tk.END)
-    elif shutil.which('sshpass'):
-        cmd = [
-            'sshpass', '-p', password,
-            'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
-            command_text
-        ]
-        output_text.insert(tk.END, f"Executing remote command with sshpass from PATH: {' '.join(cmd)}\n")
-        output_text.see(tk.END)
-        try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            threading.Thread(target=read_remote_output, args=(process, command_text), daemon=True).start()
-            status_label.config(text="Remote command started")
-            running_remote_processes.append({'process': process, 'command': command_text})
-            update_remote_commands_display()
-        except Exception as e:
-            status_label.config(text=f"Error executing remote command: {e}")
-            output_text.insert(tk.END, f"Exception: {e}\n")
-            output_text.see(tk.END)
-    elif shutil.which('ssh'):
-        cmd = [
-            'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
-            command_text
-        ]
-        output_text.insert(tk.END, f"sshpass not found; executing remote command with ssh: {' '.join(cmd)}\n")
-        output_text.see(tk.END)
-        try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            threading.Thread(target=read_remote_output, args=(process, command_text), daemon=True).start()
-            status_label.config(text="Remote command started")
-            running_remote_processes.append({'process': process, 'command': command_text})
-            update_remote_commands_display()
-        except Exception as e:
-            status_label.config(text=f"Error executing remote command: {e}")
-            output_text.insert(tk.END, f"Exception: {e}\n")
-            output_text.see(tk.END)
-    else:
+            set_status(f"Error executing remote command: {e}")
+            append_output(f"Exception: {e}\n")
+    except FileNotFoundError:
         mobaXterm_path = r"C:\Users\175912\Desktop\MobaXterm_Portable_v20.6\MobaXterm_Personal_20.6.exe"
         ssh_cmd = f"ssh -l root 127.0.0.1 -p {bind_port} \"{command_text}\""
-        output_text.insert(tk.END, "sshpass and ssh not found on PATH.\n")
-        output_text.insert(tk.END, f"Opening MobaXterm for manual execution: {mobaXterm_path} -newtab {ssh_cmd}\n")
-        output_text.see(tk.END)
+        append_output("sshpass and ssh not found on PATH.\n")
+        append_output(f"Opening MobaXterm for manual execution: {mobaXterm_path} -newtab {ssh_cmd}\n")
         try:
             subprocess.Popen([mobaXterm_path, "-newtab", ssh_cmd])
-            status_label.config(text="Opened MobaXterm for manual remote command")
+            set_status("Opened MobaXterm for manual remote command")
         except FileNotFoundError:
-            status_label.config(text="MobaXterm not found at specified path")
-            output_text.insert(tk.END, "Error: MobaXterm not found at specified path\n")
-            output_text.see(tk.END)
+            set_status("MobaXterm not found at specified path")
+            append_output("Error: MobaXterm not found at specified path\n")
         except Exception as e:
-            status_label.config(text=f"Error opening MobaXterm: {e}")
-            output_text.insert(tk.END, f"Error opening MobaXterm: {e}\n")
-            output_text.see(tk.END)
+            set_status(f"Error opening MobaXterm: {e}")
+            append_output(f"Error opening MobaXterm: {e}\n")
 
 # Create GUI
 root = tk.Tk()
@@ -379,8 +549,17 @@ tk.Label(left_frame, text="Secret Key (sk):").pack(pady=5)
 sk_entry = tk.Entry(left_frame, width=30)
 sk_entry.pack(pady=5)
 
+batch_key_frame = tk.Frame(left_frame)
+batch_key_frame.pack(pady=5)
+import_keys_button = tk.Button(batch_key_frame, text="Import Key List", command=import_secret_keys)
+import_keys_button.pack(side=tk.LEFT, padx=5)
+batch_run_button = tk.Button(batch_key_frame, text="Batch Run Command", command=run_batch_remote_commands)
+batch_run_button.pack(side=tk.LEFT, padx=5)
+key_count_label = tk.Label(left_frame, text="Imported keys: 0")
+key_count_label.pack(pady=5)
+
 tk.Label(left_frame, text="SSH Password:").pack(pady=5)
-password_combo = ttk.Combobox(left_frame, width=40, values=["11", "Xfesd203DSRGiedlxadF", "Psg-vsn.110"], state="readonly")
+password_combo = ttk.Combobox(left_frame, width=40, values=["11", "Xfesd203DSRGiedlxadF", "Psg-vsn.110", "root"], state="readonly")
 password_combo.pack(pady=5)
 password_combo.set("11")
 
