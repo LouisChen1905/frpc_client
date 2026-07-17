@@ -34,7 +34,10 @@ def parse_args():
                         help="结束时间，HH:MM:SS.mmm 或 YY-MM-DD HH:MM:SS.mmm")
     parser.add_argument("--save", metavar="PNG", help="将图表保存为 PNG")
     parser.add_argument("--csv", metavar="CSV", help="导出逐次统计明细")
-    parser.add_argument("--excel", metavar="XLSX", help="导出 Excel 汇总和明细")
+    parser.add_argument(
+        "--excel", metavar="XLSX", default="zpath_timing.xlsx",
+        help="导出 Excel 汇总和明细（默认: zpath_timing.xlsx）",
+    )
     parser.add_argument("--no-show", action="store_true", help="不弹出图表窗口")
     return parser.parse_args()
 
@@ -132,6 +135,23 @@ def inside_any(interval, containers):
 
 
 def analyze(events, window_start, window_end):
+    log_start = events[0]["time"]
+    log_end = events[-1]["time"]
+    all_coverage = build_intervals(
+        events, 1, "COVERAGE", log_start, log_end
+    )
+    coverage_intervals = [
+        item for item in all_coverage
+        if item["start"] <= window_start and item["end"] >= window_end
+    ]
+    all_edge_coverage = build_intervals(
+        events, 2, "EDGE_COVERAGE", log_start, log_end
+    )
+    edge_intervals = [
+        item for item in all_edge_coverage
+        if inside_any(item, coverage_intervals)
+    ]
+
     zpaths = build_intervals(events, 2, "ZPATH", window_start, window_end)
     if not zpaths:
         raise ValueError("指定时间段内没有有效的 HSM_2 ZPATH 状态")
@@ -169,7 +189,7 @@ def analyze(events, window_start, window_end):
             "start_line": go["start_line"],
             "end_line": go["end_line"],
         })
-    return zpaths, child_intervals, rows
+    return coverage_intervals, edge_intervals, zpaths, child_intervals, rows
 
 
 def duration_text(seconds):
@@ -191,7 +211,11 @@ def describe(values):
     }
 
 
-def print_summary(window_start, window_end, zpaths, child_intervals, rows):
+def print_summary(window_start, window_end, coverage_intervals, edge_intervals,
+                  zpaths, child_intervals, rows):
+    coverage_stats = describe([item["duration"] for item in coverage_intervals])
+    edge_stats = describe([item["duration"] for item in edge_intervals])
+    zpath_stats = describe([item["duration"] for item in zpaths])
     go_stats = describe([row["go_duration"] for row in rows])
     state_stats = {
         state: describe([item["duration"] for item in intervals])
@@ -209,7 +233,12 @@ def print_summary(window_start, window_end, zpaths, child_intervals, rows):
     print("{:<24} {:>6} {:>12} {:>10} {:>10} {:>10} {:>10}".format(
         "项目", "次数", "总时长(s)", "平均(s)", "中位(s)", "最小(s)", "最大(s)"
     ))
-    summary_items = [("GO_POSITION", go_stats)]
+    summary_items = [
+        ("COVERAGE", coverage_stats),
+        ("COVERAGE 中 EDGE", edge_stats),
+        ("ZPATH", zpath_stats),
+        ("GO_POSITION", go_stats),
+    ]
     summary_items.extend(
         ("GO 中 " + state, state_stats[state]) for state in sorted(state_stats)
     )
@@ -218,6 +247,14 @@ def print_summary(window_start, window_end, zpaths, child_intervals, rows):
             label, stats["count"], stats["total"], stats["average"],
             stats["median"], stats["minimum"], stats["maximum"]
         ))
+    coverage_total = coverage_stats["total"]
+    edge_ratio = edge_stats["total"] / coverage_total if coverage_total else 0.0
+    print("EDGE_COVERAGE / COVERAGE 时长占比: {:.2%}".format(edge_ratio))
+    zpath_total = sum(item["duration"] for item in zpaths)
+    zpath_ratio = zpath_total / coverage_total if coverage_total else 0.0
+    print("ZPATH / COVERAGE 时长占比: {:.2%}".format(zpath_ratio))
+    go_ratio = go_stats["total"] / zpath_total if zpath_total else 0.0
+    print("GO_POSITION / ZPATH 时长占比: {:.2%}".format(go_ratio))
     for state in sorted(state_stats):
         ratio = state_stats[state]["total"] / go_stats["total"] if go_stats["total"] else 0.0
         print("{} / GO_POSITION 时长占比: {:.2%}".format(state, ratio))
@@ -246,8 +283,8 @@ def export_csv(path, rows, child_states):
             writer.writerow(values)
 
 
-def export_excel(path, window_start, window_end, zpaths,
-                 child_intervals, rows):
+def export_excel(path, window_start, window_end, coverage_intervals,
+                 edge_intervals, zpaths, child_intervals, rows):
     try:
         from openpyxl import Workbook
         from openpyxl.chart import BarChart, Reference
@@ -260,28 +297,39 @@ def export_excel(path, window_start, window_end, zpaths,
     summary.title = "汇总"
     details = workbook.create_sheet("GO明细")
     state_details = workbook.create_sheet("状态明细")
+    coverage_details = workbook.create_sheet("COVERAGE明细")
     child_states = sorted(child_intervals)
+    coverage_stats = describe([item["duration"] for item in coverage_intervals])
+    edge_stats = describe([item["duration"] for item in edge_intervals])
+    zpath_stats = describe([item["duration"] for item in zpaths])
     go_stats = describe([row["go_duration"] for row in rows])
+    zpath_total = zpath_stats["total"]
 
     summary.append(["ZPATH GO_POSITION 状态时长统计"])
     summary.append(["开始时间", window_start])
     summary.append(["结束时间", window_end])
-    summary.append(["ZPATH有效时长(s)", sum(item["duration"] for item in zpaths)])
+    summary.append(["ZPATH有效时长(s)", zpath_total])
     summary.append([])
     summary.append(["状态", "次数", "总时长(s)", "平均(s)", "中位(s)",
-                    "最小(s)", "最大(s)", "占GO比例"])
+                    "最小(s)", "最大(s)", "占父状态比例"])
 
-    summary_rows = [("GO_POSITION", go_stats)]
+    summary_rows = [
+        ("COVERAGE", coverage_stats, coverage_stats["total"]),
+        ("EDGE_COVERAGE", edge_stats, coverage_stats["total"]),
+        ("ZPATH", zpath_stats, coverage_stats["total"]),
+        ("GO_POSITION", go_stats, zpath_total),
+    ]
     summary_rows.extend(
-        (state, describe([item["duration"] for item in child_intervals[state]]))
+        (state, describe([item["duration"] for item in child_intervals[state]]),
+         go_stats["total"])
         for state in child_states
     )
-    for state, stats in summary_rows:
-        ratio = stats["total"] / go_stats["total"] if go_stats["total"] else 0.0
+    for state, stats, parent_total in summary_rows:
+        ratio = stats["total"] / parent_total if parent_total else 0.0
         summary.append([
             state, stats["count"], stats["total"], stats["average"],
             stats["median"], stats["minimum"], stats["maximum"],
-            1.0 if state == "GO_POSITION" else ratio,
+            ratio,
         ])
 
     detail_header = ["序号", "GO开始", "GO结束", "GO时长(s)"]
@@ -312,9 +360,24 @@ def export_excel(path, window_start, window_end, zpaths,
                 interval["duration"], interval["start_line"], interval["end_line"],
             ])
 
+    coverage_details.append([
+        "类型", "序号", "开始时间", "结束时间", "时长(s)", "开始行", "结束行"
+    ])
+    for state, intervals in (
+        ("COVERAGE", coverage_intervals),
+        ("EDGE_COVERAGE", edge_intervals),
+    ):
+        for index, interval in enumerate(intervals, 1):
+            coverage_details.append([
+                state, index, interval["start"], interval["end"],
+                interval["duration"], interval["start_line"], interval["end_line"],
+            ])
+
     header_fill = PatternFill("solid", fgColor="176B87")
     header_font = Font(color="FFFFFF", bold=True)
-    for sheet, header_row in ((summary, 6), (details, 1), (state_details, 1)):
+    for sheet, header_row in (
+        (summary, 6), (details, 1), (state_details, 1), (coverage_details, 1)
+    ):
         for cell in sheet[header_row]:
             cell.fill = header_fill
             cell.font = header_font
@@ -337,11 +400,15 @@ def export_excel(path, window_start, window_end, zpaths,
     for row_number in range(2, state_details.max_row + 1):
         state_details.cell(row_number, 3).number_format = "yyyy-mm-dd hh:mm:ss.000"
         state_details.cell(row_number, 4).number_format = "yyyy-mm-dd hh:mm:ss.000"
+    for row_number in range(2, coverage_details.max_row + 1):
+        coverage_details.cell(row_number, 3).number_format = "yyyy-mm-dd hh:mm:ss.000"
+        coverage_details.cell(row_number, 4).number_format = "yyyy-mm-dd hh:mm:ss.000"
 
     widths = {
         summary: [20, 22, 16, 14, 14, 14, 14, 14],
         details: [8, 24, 24, 14] + [14, 12] * len(child_states) + [10, 10],
         state_details: [10, 20, 24, 24, 14, 10, 10],
+        coverage_details: [20, 10, 24, 24, 14, 10, 10],
     }
     for sheet, column_widths in widths.items():
         for index, width in enumerate(column_widths, 1):
@@ -362,7 +429,8 @@ def export_excel(path, window_start, window_end, zpaths,
     workbook.save(str(path))
 
 
-def draw_chart(rows, window_start, window_end, child_states,
+def draw_chart(rows, window_start, window_end, coverage_intervals,
+               edge_intervals, child_states,
                save_path=None, show=True):
     try:
         import matplotlib.pyplot as plt
@@ -401,16 +469,20 @@ def draw_chart(rows, window_start, window_end, child_states,
     timeline.grid(axis="y", alpha=0.25)
     timeline.legend()
 
-    labels = ["GO_POSITION"] + child_states
-    values = [go_total] + [state_totals[state] for state in child_states]
-    bar_colors = ["#176B87"] + [
+    labels = ["COVERAGE", "EDGE_COVERAGE", "GO_POSITION"] + child_states
+    values = [
+        sum(item["duration"] for item in coverage_intervals),
+        sum(item["duration"] for item in edge_intervals),
+        go_total,
+    ] + [state_totals[state] for state in child_states]
+    bar_colors = ["#4C4C4C", "#E6AB02", "#176B87"] + [
         colors[index % len(colors)] for index in range(len(child_states))
     ]
     totals.bar(labels, values, color=bar_colors)
     for index, value in enumerate(values):
         totals.text(index, value, "{:.3f}s".format(value), ha="center", va="bottom")
     totals.set_ylabel("Total duration (seconds)")
-    totals.set_title("GO_POSITION time composition")
+    totals.set_title("State duration totals")
     totals.grid(axis="y", alpha=0.25)
 
     bins = min(30, max(8, int(len(rows) ** 0.5 * 2)))
@@ -455,12 +527,17 @@ def main():
     if window_end <= window_start:
         window_end += timedelta(days=1)
 
-    zpaths, child_intervals, rows = analyze(events, window_start, window_end)
+    coverage_intervals, edge_intervals, zpaths, child_intervals, rows = analyze(
+        events, window_start, window_end
+    )
     if not rows:
         raise ValueError("指定时间段的 ZPATH 中没有找到 GO_POSITION")
 
     child_states = sorted(child_intervals)
-    print_summary(window_start, window_end, zpaths, child_intervals, rows)
+    print_summary(
+        window_start, window_end, coverage_intervals, edge_intervals,
+        zpaths, child_intervals, rows,
+    )
     if args.csv:
         csv_path = Path(args.csv)
         export_csv(csv_path, rows, child_states)
@@ -468,12 +545,14 @@ def main():
     if args.excel:
         excel_path = Path(args.excel)
         export_excel(
-            excel_path, window_start, window_end, zpaths,
+            excel_path, window_start, window_end,
+            coverage_intervals, edge_intervals, zpaths,
             child_intervals, rows,
         )
         print("Excel 已导出: {}".format(excel_path.resolve()))
     draw_chart(
-        rows, window_start, window_end, child_states,
+        rows, window_start, window_end, coverage_intervals,
+        edge_intervals, child_states,
         save_path=Path(args.save) if args.save else None,
         show=not args.no_show,
     )
