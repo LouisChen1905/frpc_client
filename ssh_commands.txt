@@ -1,0 +1,14 @@
+uname -a
+id
+ls -la
+tail -f /mnt/cache/log/Navigation.log
+grep "event message" /mnt/cache/log/Navigation.log
+grep "event message 27" /mnt/cache/log/Navigation.log
+cat /mnt/user_data/config/hmiapp_user.yaml
+grep "event\ message" /mnt/cache/log/Navigation.log
+grep -h "event\ message" /mnt/cache/log/backup/Navigation.log_202606* /mnt/cache/log/Navigation.log
+ls /mnt/user_app/
+grep -h "event\ message 27" /mnt/cache/log/backup/Navigation.log_202606* /mnt/cache/log/Navigation.log
+grep -h "event\ message\ 27" /mnt/cache/log/backup/Navigation.log_202606* /mnt/cache/log/Navigation.log
+grep -h "event\ message\ 27" /mnt/cache/log/backup/Navigation.log_202606* | wc -l
+grep -h "event\ message\ 27" /mnt/cache/log/backup/Navigation.log_2026052* /mnt/cache/log/backup/Navigation.log_2026053* | wc -l

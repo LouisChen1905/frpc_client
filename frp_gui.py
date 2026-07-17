@@ -22,6 +22,11 @@ batch_running = False
 
 command_file = os.path.join(os.path.dirname(__file__), 'ssh_commands.txt')
 ansi_escape_pattern = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+SUBPROCESS_TEXT_KWARGS = {
+    'text': True,
+    'encoding': 'utf-8',
+    'errors': 'replace'
+}
 
 
 def append_output(message):
@@ -91,7 +96,7 @@ bind_port = {bind_port}
 
 def create_temp_config(sk, bind_port):
     config_content = build_config_content(sk, bind_port)
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.ini', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.ini', delete=False, encoding='utf-8') as f:
         f.write(config_content)
         return f.name
 
@@ -105,7 +110,7 @@ def start_frpc_instance(sk, password, keep_running=True):
         ['frpc.exe', '-c', temp_config],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        **SUBPROCESS_TEXT_KWARGS
     )
 
     instance = {
@@ -169,7 +174,7 @@ def execute_remote_command_sync(bind_port, password, command_text, timeout=120):
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        **SUBPROCESS_TEXT_KWARGS,
         timeout=timeout
     )
     return {
@@ -181,7 +186,7 @@ def execute_remote_command_sync(bind_port, password, command_text, timeout=120):
 
 
 def normalize_secret_key(raw_key):
-    key = raw_key.strip()
+    key = raw_key.replace('\ufeff', '').strip()
     if key.upper().startswith('XRM'):
         digits = ''.join(ch for ch in key if ch.isdigit())
         if len(digits) >= 10:
@@ -198,7 +203,7 @@ def import_secret_keys():
         return
 
     keys = []
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(file_path, 'r', encoding='utf-8-sig') as f:
         for line in f:
             for part in line.replace(',', '\n').splitlines():
                 key = normalize_secret_key(part)
@@ -270,7 +275,8 @@ def run_batch_remote_commands():
         set_status('Batch execution started')
 
         try:
-            for index, sk in enumerate(imported_secret_keys, start=1):
+            for index, raw_sk in enumerate(imported_secret_keys, start=1):
+                sk = normalize_secret_key(raw_sk)
                 append_output(f"\n[{index}/{len(imported_secret_keys)}] Processing key: {sk}\n")
                 set_status(f"Processing {index}/{len(imported_secret_keys)}: {sk}")
 
@@ -338,7 +344,7 @@ def update_remote_commands_display():
             running_remote_processes.remove(rem)
 
 def run_frpc():
-    sk = sk_entry.get().strip()
+    sk = normalize_secret_key(sk_entry.get())
     if not sk:
         set_status("Please enter a secret key (sk)")
         return
@@ -500,7 +506,7 @@ def run_remote_command():
         cmd = build_ssh_command(bind_port, password, command_text)
         append_output(f"Executing remote command: {' '.join(cmd)}\n")
         try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **SUBPROCESS_TEXT_KWARGS)
             threading.Thread(target=read_remote_output, args=(process, command_text), daemon=True).start()
             set_status("Remote command started")
             running_remote_processes.append({'process': process, 'command': command_text})
@@ -553,7 +559,7 @@ key_count_label = tk.Label(left_frame, text="Imported keys: 0")
 key_count_label.pack(pady=5)
 
 tk.Label(left_frame, text="SSH Password:").pack(pady=5)
-password_combo = ttk.Combobox(left_frame, width=40, values=["11", "Xfesd203DSRGiedlxadF", "Psg-vsn.110"], state="readonly")
+password_combo = ttk.Combobox(left_frame, width=40, values=["11", "Xfesd203DSRGiedlxadF", "Psg-vsn.110", "root"], state="readonly")
 password_combo.pack(pady=5)
 password_combo.set("11")
 
