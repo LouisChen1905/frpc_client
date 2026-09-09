@@ -9,6 +9,7 @@ import shutil
 import csv
 import time
 import re
+import stat
 from datetime import datetime
 
 # List to store multiple instances
@@ -21,6 +22,9 @@ imported_secret_keys = []
 batch_running = False
 
 command_file = os.path.join(os.path.dirname(__file__), 'ssh_commands.txt')
+sk_history_file = os.path.join(os.path.dirname(__file__), 'sk_history.txt')
+sk_history = []
+MAX_SK_HISTORY = 100
 ansi_escape_pattern = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
 SUBPROCESS_TEXT_KWARGS = {
     'text': True,
@@ -101,17 +105,40 @@ def create_temp_config(sk, bind_port):
         return f.name
 
 
+def get_frpc_executable():
+    """Return the platform-specific FRPC binary stored beside this script."""
+    binary_name = 'frpc.exe' if os.name == 'nt' else 'frpc'
+    executable = os.path.join(os.path.dirname(__file__), binary_name)
+    if not os.path.isfile(executable):
+        raise FileNotFoundError(f'{binary_name} not found in the application directory')
+
+    # Linux downloads may not retain the executable bit after being copied.
+    if os.name != 'nt' and not os.access(executable, os.X_OK):
+        try:
+            os.chmod(executable, os.stat(executable).st_mode | stat.S_IXUSR)
+        except OSError as e:
+            raise PermissionError(f'Cannot make {binary_name} executable: {e}') from e
+    return executable
+
+
 def start_frpc_instance(sk, password, keep_running=True):
     bind_port = random.randint(10000, 65535)
     port_label.config(text=f"Next port: {bind_port}")
     temp_config = create_temp_config(sk, bind_port)
 
-    process = subprocess.Popen(
-        ['frpc.exe', '-c', temp_config],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        **SUBPROCESS_TEXT_KWARGS
-    )
+    try:
+        process = subprocess.Popen(
+            [get_frpc_executable(), '-c', temp_config],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **SUBPROCESS_TEXT_KWARGS
+        )
+    except Exception:
+        try:
+            os.unlink(temp_config)
+        except OSError:
+            pass
+        raise
 
     instance = {
         'process': process,
@@ -147,7 +174,8 @@ def cleanup_instance(inst, remove_from_running=True):
 
 
 def build_ssh_command(bind_port, password, command_text):
-    sshpass_local = os.path.join(os.path.dirname(__file__), 'sshpass.exe')
+    sshpass_name = 'sshpass.exe' if os.name == 'nt' else 'sshpass'
+    sshpass_local = os.path.join(os.path.dirname(__file__), sshpass_name)
     if os.path.exists(sshpass_local):
         return [
             sshpass_local, '-p', password,
@@ -165,7 +193,7 @@ def build_ssh_command(bind_port, password, command_text):
             'ssh', '-o', 'StrictHostKeyChecking=no', '-l', 'root', '127.0.0.1', '-p', str(bind_port),
             command_text
         ]
-    raise FileNotFoundError('sshpass.exe / sshpass / ssh not found')
+    raise FileNotFoundError('sshpass / ssh not found')
 
 
 def execute_remote_command_sync(bind_port, password, command_text, timeout=120):
@@ -192,6 +220,69 @@ def normalize_secret_key(raw_key):
         if len(digits) >= 10:
             return digits[-10:]
     return key
+
+
+def load_sk_history():
+    """Load unique SK values, keeping the most recently used first."""
+    sk_history.clear()
+    if os.path.exists(sk_history_file):
+        try:
+            with open(sk_history_file, 'r', encoding='utf-8-sig') as f:
+                for line in f:
+                    key = normalize_secret_key(line)
+                    if key and key not in sk_history:
+                        sk_history.append(key)
+        except OSError as e:
+            set_status(f"Could not load SK history: {e}")
+    refresh_sk_history_combo()
+
+
+def save_sk_history():
+    try:
+        with open(sk_history_file, 'w', encoding='utf-8') as f:
+            for key in sk_history[:MAX_SK_HISTORY]:
+                f.write(key + '\n')
+    except OSError as e:
+        set_status(f"Could not save SK history: {e}")
+        return False
+    return True
+
+
+def refresh_sk_history_combo():
+    sk_entry['values'] = sk_history
+
+
+def remember_secret_key(raw_key):
+    key = normalize_secret_key(raw_key)
+    if not key:
+        return
+    if key in sk_history:
+        sk_history.remove(key)
+    sk_history.insert(0, key)
+    del sk_history[MAX_SK_HISTORY:]
+    save_sk_history()
+    refresh_sk_history_combo()
+    sk_entry.set(key)
+
+
+def delete_current_sk_history():
+    key = normalize_secret_key(sk_entry.get())
+    if key not in sk_history:
+        set_status("Current SK is not in history")
+        return
+    sk_history.remove(key)
+    if save_sk_history():
+        refresh_sk_history_combo()
+        sk_entry.set('')
+        set_status("SK removed from history")
+
+
+def clear_sk_history():
+    sk_history.clear()
+    if save_sk_history():
+        refresh_sk_history_combo()
+        sk_entry.set('')
+        set_status("SK history cleared")
 
 
 def import_secret_keys():
@@ -351,9 +442,11 @@ def run_frpc():
 
     try:
         inst = start_frpc_instance(sk, password_combo.get(), keep_running=True)
+        remember_secret_key(sk)
         set_status(f"FRP instance started on port {inst['port']}")
     except FileNotFoundError:
-        set_status("frpc.exe not found in current directory")
+        binary_name = 'frpc.exe' if os.name == 'nt' else 'frpc'
+        set_status(f"{binary_name} not found in the application directory")
     except Exception as e:
         set_status(f"Error running frpc: {str(e)}")
 
@@ -546,8 +639,19 @@ output_text.pack(fill=tk.BOTH, expand=True)
 
 # Controls in right frame
 tk.Label(left_frame, text="Secret Key (sk):").pack(pady=5)
-sk_entry = tk.Entry(left_frame, width=30)
+sk_entry = ttk.Combobox(left_frame, width=38)
 sk_entry.pack(pady=5)
+
+sk_history_button_frame = tk.Frame(left_frame)
+sk_history_button_frame.pack(pady=2)
+delete_sk_button = tk.Button(
+    sk_history_button_frame, text="Delete Current History", command=delete_current_sk_history
+)
+delete_sk_button.pack(side=tk.LEFT, padx=5)
+clear_sk_button = tk.Button(
+    sk_history_button_frame, text="Clear SK History", command=clear_sk_history
+)
+clear_sk_button.pack(side=tk.LEFT, padx=5)
 
 batch_key_frame = tk.Frame(left_frame)
 batch_key_frame.pack(pady=5)
@@ -604,6 +708,7 @@ stop_remote_button.pack(side=tk.LEFT, padx=5)
 status_label = tk.Label(left_frame, text="")
 status_label.pack(pady=5)
 
+load_sk_history()
 refresh_command_combo()
 root.resizable(True, True)
 root.mainloop()
